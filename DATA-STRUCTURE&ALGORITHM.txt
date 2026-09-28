@@ -1,0 +1,280 @@
+# Modern Parking System — Task One
+### Data Structures and Algorithms: Design Report
+**Multimedia University of Kenya — DSA**
+
+---
+
+## 1. Analysis of the Client's Terms of Reference
+
+Breaking the client's brief into discrete requirements:
+
+| # | Requirement (from brief) | Implication |
+|---|---------------------------|--------------|
+| 1 | Drivers see available slots before entry | Need a live slot-availability read/display path |
+| 2 | System records vehicles on arrival | Need an entry-capture and registration process |
+| 3 | System calculates time spent and fee on exit | Need duration tracking + a tariff lookup |
+| 4 | Barrier opens only after fee payment | Need a payment gate tied to barrier control |
+| 5 | (Task Two) Web-based, well-commented | Backend must expose these operations as an API (Django + DRF), frontend consumes it (Next.js) |
+| 6 | (Task Two) Tiered fee structure | Tariff must be data-driven, not hardcoded, since bands could change |
+
+From this, seven modules cover the full brief with no gaps and no overlap.
+
+---
+
+## 2. Proposed System Modules
+
+1. **Slot Availability Module** — tracks and reports free/occupied slots
+2. **Vehicle Entry Module** — captures a vehicle, assigns a slot, opens the entry barrier
+3. **Vehicle Exit Module** — locates the active session, triggers fee calculation
+4. **Fee Calculation Module** — applies the tariff bands to elapsed time
+5. **Payment Module** — handles the payment step before exit
+6. **Barrier Control Module** — the physical/simulated gate state machine, shared by entry and exit
+7. **Admin & Reporting Module** — configure slots/gates/tariffs, view occupancy and revenue
+
+Each module maps to one responsibility, which keeps them independently testable and later maps cleanly onto separate Django apps (`slots`, `sessions`, `payments`, `gates`, `reports`).
+
+---
+
+## 3. Algorithms for Each Module
+
+### 3.1 Slot Availability Module
+
+```
+FUNCTION getAvailableSlots(lot_id):
+    slots = SlotStore.getByLot(lot_id)          # array of slot records
+    available = 0
+    FOR each slot IN slots:
+        IF slot.status == AVAILABLE:
+            available += 1
+    RETURN { total: slots.length, available: available }
+
+FUNCTION getSlotGrid(lot_id):                   # for the visual display
+    RETURN SlotStore.getByLot(lot_id)            # each with slot_number + status
+```
+Triggered on a timer or pushed whenever `assignSlot`/`releaseSlot` runs, so the display never goes stale.
+
+### 3.2 Vehicle Entry Module
+
+```
+FUNCTION handleEntry(plate_number, gate_id):
+    IF getAvailableSlots(lot_id).available == 0:
+        RETURN reject("Lot full")
+
+    slot = findNearestFreeSlot(lot_id, gate_id)  # see Data Structures, 4.3
+    vehicle = VehicleStore.getOrCreate(plate_number)
+
+    session = ParkingSession.create(
+        vehicle_id = vehicle.id,
+        slot_id = slot.id,
+        entry_gate_id = gate_id,
+        entry_time = now(),
+        status = ACTIVE
+    )
+
+    ActiveSessions.put(plate_number, session)    # hash map, see 4.1
+    slot.status = OCCUPIED
+    openBarrier(gate_id)
+    RETURN accept(session)
+```
+
+### 3.3 Vehicle Exit Module
+
+```
+FUNCTION handleExit(plate_number, gate_id):
+    session = ActiveSessions.get(plate_number)   # O(1) lookup
+    IF session is NULL:
+        RETURN error("No active session for this plate")
+
+    duration = now() - session.entry_time
+    fee = calculateFee(duration, session.lot_id)
+
+    payment = requestPayment(session.id, fee)    # 3.5
+    IF payment.status != PAID:
+        RETURN hold("Payment required before barrier opens")
+
+    session.exit_time = now()
+    session.status = COMPLETED
+    session.amount_paid = fee
+    ParkingSession.save(session)
+
+    slot = SlotStore.get(session.slot_id)
+    slot.status = AVAILABLE
+    ActiveSessions.remove(plate_number)
+
+    openBarrier(gate_id)
+    RETURN accept(session)
+```
+
+### 3.4 Fee Calculation Module
+
+Tariff bands are read from the database (dynamic, admin-editable), not hardcoded, so a change in pricing needs no redeployment:
+
+```
+FUNCTION calculateFee(duration_minutes, lot_id):
+    bands = TariffStore.getSortedBands(lot_id)   # sorted ascending by min_minutes
+    FOR each band IN bands:
+        IF duration_minutes >= band.min_minutes AND duration_minutes <= band.max_minutes:
+            RETURN band.amount
+    RETURN bands.last.amount                     # open-ended top band (e.g. "over 6 hours")
+```
+With current values this evaluates to: ≤30 min → free, ≤2 hrs → 50, ≤4 hrs → 100, ≤6 hrs → 300, over 6 hrs → 500 — but nothing in the algorithm depends on those exact numbers.
+
+### 3.5 Payment Module
+
+```
+FUNCTION requestPayment(session_id, amount):
+    payment = Payment.create(session_id, amount, status=PENDING)
+    response = PaymentGateway.charge(payment)     # mock endpoint, swappable later
+    IF response.success:
+        payment.status = PAID
+        payment.reference = response.reference
+    ELSE:
+        payment.status = FAILED
+    Payment.save(payment)
+    RETURN payment
+```
+Kept behind one interface (`PaymentGateway.charge`) so a mock implementation today can later be swapped for a real provider (e.g. M-Pesa Daraja) without touching the exit algorithm.
+
+### 3.6 Barrier Control Module
+
+A small state machine shared by both gates:
+
+```
+STATES: CLOSED, OPENING, OPEN, CLOSING
+
+FUNCTION openBarrier(gate_id):
+    setState(gate_id, OPENING)
+    signalHardwareOrUI(gate_id, "OPEN")
+    setState(gate_id, OPEN)
+    startTimer(gate_id, AUTO_CLOSE_SECONDS)
+
+FUNCTION onTimerExpiry(gate_id):
+    setState(gate_id, CLOSING)
+    signalHardwareOrUI(gate_id, "CLOSE")
+    setState(gate_id, CLOSED)
+```
+
+### 3.7 Admin & Reporting Module
+
+```
+FUNCTION getOccupancyReport(lot_id, from_date, to_date):
+    sessions = ParkingSession.filter(lot_id, entry_time BETWEEN from_date AND to_date)
+    RETURN {
+        total_sessions: sessions.count,
+        average_duration: average(sessions.duration),
+        total_revenue: sum(sessions.amount_paid)
+    }
+```
+Slot, gate and tariff CRUD are plain create/read/update/delete operations exposed to admins only.
+
+---
+
+## 4. Data Structures Used and Justification
+
+| Structure | Used for | Why this structure |
+|---|---|---|
+| **Hash map** (`ActiveSessions`, keyed by plate number) | Looking up a vehicle's session on exit | Average **O(1)** lookup/insert/delete — critical because exit must be fast even with hundreds of vehicles parked at once. Backed in Django by an indexed `plate_number` column; can be mirrored in Redis for very high-traffic lots. |
+| **Array / fixed list** (`ParkingSlot` collection per lot) | Representing the physical layout for the slot-availability display | O(1) access by slot number; iterating the whole array to render the visual grid is naturally O(n), which matches how the UI needs to draw it (one cell per physical slot). |
+| **Priority queue / min-heap** (optional, `findNearestFreeSlot`) | Assigning the closest free slot to the entry gate rather than the first free slot found | O(log n) insert/extract vs. O(n) for a linear scan every time a car enters; matters once slot counts grow. |
+| **FIFO queue** (overflow line) | Vehicles that arrive when the lot is full | Preserves arrival order fairly; O(1) enqueue/dequeue — a natural fit for "first come, first served" once a slot frees up. |
+| **Sorted list** (`Tariff` bands) | Fee calculation | Bands are stored sorted by `min_minutes`, enabling a simple linear (or binary-search) lookup; sorted storage also makes it trivial for an admin to insert a new band without breaking lookup logic. |
+| **Records / structs** (`Vehicle`, `ParkingSlot`, `ParkingSession`, `Payment`) | Grouping related fields as one unit | Each maps directly onto a Django model — a class with named fields — which is why choosing clean records at the design stage keeps Task Two's ORM models almost a 1:1 translation of this report. |
+| **Append-only log / linked list conceptually** (`ParkingSession` history) | Historical records for reporting | Sessions are never deleted, only marked `COMPLETED`; chronological append matches how reports need to scan history in order. |
+
+---
+
+## 5. Dynamic Database Design
+
+"Dynamic" here means: no hardcoded slot counts, gates, or tariff bands — all are rows in the database that an admin can add, edit, or deactivate without a code change or redeploy. The schema is normalized (3NF) to avoid duplicate/inconsistent data as it grows to multiple lots.
+
+### 5.1 Entity–Relationship Diagram
+
+```mermaid
+erDiagram
+    PARKING_LOT ||--o{ PARKING_SLOT : contains
+    PARKING_LOT ||--o{ GATE : has
+    PARKING_LOT ||--o{ TARIFF : defines
+    PARKING_SLOT ||--o{ PARKING_SESSION : "used in"
+    VEHICLE ||--o{ PARKING_SESSION : makes
+    GATE ||--o{ PARKING_SESSION : "entry via"
+    PARKING_SESSION ||--|| PAYMENT : settled_by
+
+    PARKING_LOT {
+        int id PK
+        string name
+        string location
+        int total_slots
+    }
+    PARKING_SLOT {
+        int id PK
+        int lot_id FK
+        int slot_number
+        string status
+        string slot_type
+    }
+    GATE {
+        int id PK
+        int lot_id FK
+        int gate_number
+        string gate_type
+        string status
+    }
+    VEHICLE {
+        int id PK
+        string plate_number
+        string vehicle_type
+        datetime first_seen
+    }
+    PARKING_SESSION {
+        int id PK
+        int vehicle_id FK
+        int slot_id FK
+        int entry_gate_id FK
+        int exit_gate_id FK
+        datetime entry_time
+        datetime exit_time
+        string status
+        decimal amount_paid
+    }
+    TARIFF {
+        int id PK
+        int lot_id FK
+        int min_minutes
+        int max_minutes
+        decimal amount
+        date effective_from
+    }
+    PAYMENT {
+        int id PK
+        int session_id FK
+        decimal amount
+        string method
+        string status
+        string reference
+        datetime paid_at
+    }
+```
+
+### 5.2 Table Notes
+
+- **ParkingLot** — supports multiple sites later without any schema change; `total_slots` is derived/cached, not authoritative (the `ParkingSlot` rows are the source of truth).
+- **ParkingSlot** — `status` is one of `AVAILABLE`, `OCCUPIED`, `RESERVED`, `MAINTENANCE`. Slots can be added or taken offline by an admin at any time.
+- **Gate** — separates entry and exit gates (`gate_type`), and supports multiple gates per lot.
+- **Vehicle** — `plate_number` is unique; a returning vehicle reuses its record, so the system naturally accumulates a visit history per plate.
+- **ParkingSession** — the central transactional table; one row per visit, `status` moves `ACTIVE → COMPLETED`. Indexed on `plate_number` (via `vehicle_id`) and `status` for the fast active-session lookup in 4.1.
+- **Tariff** — the dynamic pricing table described in 3.4; `effective_from` allows future rate changes to be scheduled without deleting the pricing history.
+- **Payment** — one-to-one with a session; kept separate from `ParkingSession` so the payment method/provider can change without touching the core session table.
+
+### 5.3 Why This Is "Dynamic"
+
+- Adding a slot, gate, or lot = inserting a row, not writing code.
+- Changing prices = editing `Tariff` rows (with an effective date), not editing the fee algorithm.
+- The schema scales from one lot/one gate to many lots/many gates without structural changes — only more rows.
+
+---
+
+## 6. Summary
+
+The seven modules above cover every requirement in the client's brief: visual slot availability, arrival recording, automatic duration/fee calculation on exit, and a payment-gated barrier. The hash map and array choices keep the two time-critical paths (exit lookup, slot display) fast, and the normalized, tariff-driven database means the system can be reconfigured — new slots, new gates, new prices — without code changes, which is what "dynamic" is asking for.
+
+This design maps directly onto Django apps (`slots`, `sessions`, `payments`, `gates`, `reports`) exposed through Django REST Framework, with the Next.js frontend consuming the availability and session endpoints — ready as the starting point for Task Two.
